@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Encerra a sessão "$1" por completo: a sessão tmux e a árvore de processos dela (Metro, yarn, adb…).
+# Sem isso, fechar a sessão no tmux deixava o "script" e o Metro rodando órfãos (porta 8081 presa).
+S="$1"; D="$HOME/.build-remoto"
+[ -n "$S" ] || exit 0
+matar() { local c; for c in $(pgrep -P "$1"); do matar "$c"; done; kill "$1" 2>/dev/null; }
+for p in $(pgrep -f "script -qfec bash -l $D/$S.sh"); do matar "$p"; done
+tmux kill-session -t "=$S" 2>/dev/null
+exit 0

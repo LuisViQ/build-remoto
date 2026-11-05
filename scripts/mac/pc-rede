@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Atualiza o endereço do PC de build (alias "pc-build" no ~/.ssh/config) depois de trocar de Wi-Fi.
+# A identidade do PC é conferida pela chave SSH (HostKeyAlias pc-build), então um IP errado
+# ou de outra máquina nunca é aceito.
+
+CFG="$HOME/.ssh/config"
+# IP do PC no Tailscale (não muda com a rede): export BR_TAILSCALE_IP=100.x.y.z
+TAILSCALE_IP="${BR_TAILSCALE_IP:-}"
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+
+ip_atual() { awk '/^Host pc-build$/{f=1;next} /^Host /{f=0} f&&$1=="HostName"{print $2}' "$CFG"; }
+
+testa() { ssh -n -o BatchMode=yes -o ConnectTimeout=4 -o HostName="$1" pc-build true 2>/dev/null; }
+
+salva_ip() {
+  local novo="$1"
+  cp "$CFG" "$CFG.bak"
+  awk -v ip="$novo" '/^Host /{f=($0=="Host pc-build")} f&&$1=="HostName"{sub($2,ip)} {print}' "$CFG.bak" > "$CFG"
+  echo "✓ pc-build agora aponta para $novo"
+  echo "→ Reconectando as sincronizações..."
+  mutagen sync pause --all >/dev/null 2>&1; mutagen sync resume --all >/dev/null 2>&1
+  sleep 3
+  mutagen sync list | grep -E "^Name|^Status" | paste - - | sed 's/Name: /  • /; s/\tStatus:/ →/'
+  confere_rede_windows
+}
+
+# Firewall do Windows só libera SSH/Metro em redes "Particulares"
+confere_rede_windows() {
+  local cat
+  cat=$(ssh -n pc-build '/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe -NoProfile -Command "(Get-NetConnectionProfile -InterfaceAlias Wi-Fi,Ethernet* -ErrorAction SilentlyContinue | Select -Expand NetworkCategory) -join \",\""' 2>/dev/null | tr -d '\r')
+  if [[ "$cat" == *Public* ]]; then
+    echo
+    echo "⚠️  No Windows, a rede atual está como PÚBLICA. O Mac pode não conseguir conectar (SSH e Metro ficam bloqueados)."
+    echo "   No PC: Configurações → Rede e Internet → Wi-Fi → (sua rede) → marque 'Rede privada'."
+  fi
+}
+
+procurar() {
+  local meu_ip base
+  meu_ip=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null)
+  [[ -z "$meu_ip" ]] && { echo "Não achei o IP do Mac (Wi-Fi desligado?)"; return 1; }
+  base="${meu_ip%.*}"
+  echo "→ Procurando o PC em $base.1–254 (porta 2222)..."
+  local candidatos
+  candidatos=$(seq 1 254 | xargs -P 64 -I{} sh -c "nc -z -G 1 $base.{} 2222 >/dev/null 2>&1 && echo $base.{}")
+  for ip in $candidatos; do
+    if testa "$ip"; then
+      echo "✓ PC encontrado em $ip"
+      salva_ip "$ip"; return 0
+    fi
+  done
+  echo "✗ PC não encontrado nesta rede."
+  echo "  Confira se o PC está na mesma rede, com o Ubuntu (WSL) aberto e a rede como 'Particular'."
+  return 1
+}
+
+manual() {
+  read -rp "IP do PC (no Windows: ipconfig → 'Endereço IPv4'): " ip
+  [[ -z "$ip" ]] && return 1
+  if testa "$ip"; then salva_ip "$ip"
+  else echo "✗ Não conectou em $ip (IP errado, PC desligado, Ubuntu fechado ou rede pública no Windows)."; fi
+}
+
+tailscale_mac() { ifconfig | grep -q "inet 100\."; }
+
+usar_tailscale() {
+  if ! tailscale_mac; then
+    echo "O Tailscale não está ativo neste Mac. Para usar:"
+    echo "  1. Instale: brew install --cask tailscale  (ou pela App Store)"
+    echo "  2. Abra o Tailscale e entre na MESMA conta usada no PC"
+    echo "  3. Rode este atalho de novo e escolha esta opção"
+    return 1
+  fi
+  if testa "$TAILSCALE_IP"; then salva_ip "$TAILSCALE_IP"
+  else echo "✗ Não conectou pelo Tailscale ($TAILSCALE_IP). O Tailscale está ligado no PC?"; fi
+}
+
+# Modo não interativo (usado pelo app Build Remoto)
+case "${1:-}" in
+  procurar)  procurar; exit $? ;;
+  ip)        testa "$2" && salva_ip "$2" || { echo "✗ Não conectou em $2"; exit 1; }; exit 0 ;;
+  tailscale) usar_tailscale; exit $? ;;
+  atual)     ip_atual; exit 0 ;;
+esac
+
+clear
+echo "🌐 Rede do PC de build"
+echo
+atual=$(ip_atual)
+printf "Endereço atual: %s ... " "$atual"
+if testa "$atual"; then echo "✅ conectado"; else echo "❌ sem conexão"; fi
+echo
+
+PS3=$'\nEscolha (número): '
+select op in \
+  "Procurar o PC automaticamente nesta rede" \
+  "Digitar o IP do PC" \
+  "Usar Tailscale (funciona de qualquer rede, até fora de casa/escritório)" \
+  "Sair"; do
+  case $REPLY in
+    1) procurar ;;
+    2) manual ;;
+    3) usar_tailscale ;;
+    4) exit 0 ;;
+    *) echo "Opção inválida"; continue ;;
+  esac
+  echo; echo "— Escolha outra opção ou 4 para sair."
+done

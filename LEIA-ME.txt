@@ -1,0 +1,38 @@
+BUILD REMOTO — COMO INSTALAR
+============================
+
+1. INSTALAR
+   Arraste o "Build Remoto" para a pasta "Applications" (Aplicativos),
+   que está ao lado nesta janela.
+
+2. ABRIR PELA PRIMEIRA VEZ (só uma vez)
+   O app ainda não é assinado pela Apple, então o macOS bloqueia na
+   primeira abertura. É normal. Para liberar:
+
+   a) Abra o Build Remoto em Aplicativos. Vai aparecer um aviso
+      dizendo que ele não pode ser aberto — clique em "OK" / "Concluído".
+   b) Abra  Ajustes do Sistema  →  Privacidade e Segurança.
+   c) Role até o fim: aparece "Build Remoto foi bloqueado…".
+      Clique em  "Abrir Mesmo Assim"  e confirme com a senha do Mac.
+
+   Pronto: das próximas vezes ele abre normal, com dois cliques.
+   (Ao instalar uma versão nova do app, esse passo se repete uma vez.)
+
+   Alternativa pelo Terminal (faz o mesmo que os passos acima):
+       xattr -dr com.apple.quarantine "/Applications/Build Remoto.app"
+
+3. PRIMEIROS PASSOS NO APP
+   - A tela de boas-vindas mostra tudo o que o Mac precisa
+     (Node, Yarn, Java, Android SDK, AWS…). Clique em
+     "Instalar tudo o que falta": abre o Terminal, pede a senha do Mac
+     uma vez e instala tudo (10 a 40 minutos, depende da internet).
+   - Escolha a pasta onde ficam os projetos (os apps são encontrados
+     sozinhos) e clique em "Começar".
+   - Para o Git: no app, "Login AWS (git)" na barra lateral.
+     Só aparece se os projetos usarem o AWS CodeCommit.
+
+REQUISITOS
+   - Mac com Apple Silicon (M1, M2, M3, M4…)
+   - macOS 14 (Sonoma) ou mais novo
+   - Espaço livre: 30 GB ou mais (Android SDK, dependências e builds)
+

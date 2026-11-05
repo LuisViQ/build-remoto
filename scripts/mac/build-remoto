@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# Build remoto dos apps React Native/Expo no PC (WSL2), com o código ficando no Mac.
+#
+# Uso:
+#   build-remoto setup                 cria as sessões de sincronização (uma vez)
+#   build-remoto status                mostra o estado das sincronizações
+#   build-remoto tela                  espelha no Mac a tela do celular ligado no PC (scrcpy)
+#   build-remoto <projeto> debug       gera APK de debug no PC e traz para o Mac
+#   build-remoto <projeto> release     gera APK de release no PC e traz para o Mac
+#   build-remoto <projeto> android     igual ao "yarn android": build no PC, app no celular ligado no MAC
+#   build-remoto <projeto> start       igual ao "yarn start": Metro no PC, celular ligado no MAC
+#   build-remoto <projeto> run         roda "yarn android" com o celular ligado no PC
+#   build-remoto <projeto> metro       roda "yarn start" no PC (celular ligado no PC)
+#   build-remoto <projeto> metro-limpo Metro limpando o cache (--clear / --reset-cache)
+#   build-remoto <projeto> clean       ./gradlew clean no PC
+#   build-remoto <projeto> logs        logs do app (console.log, erros JS e crashes) do celular do PC
+#   build-remoto <projeto> logs-tudo   logcat completo do celular do PC
+#   build-remoto <projeto> install     roda yarn install no PC
+#   build-remoto <projeto> shell       abre um terminal no projeto dentro do PC
+#
+# Adicione "--instalar" ao debug/release para instalar o APK via adb do Mac.
+
+set -euo pipefail
+
+PC_HOST="pc-build"              # alias definido em ~/.ssh/config
+REMOTE_DIR="~/apps"              # pasta no WSL onde ficam as cópias
+# Um caminho de projeto por linha, ex.: /Users/voce/projetos/MeuApp
+LISTA="${XDG_CONFIG_HOME:-$HOME/.config}/build-remoto/projetos"
+PROJETOS=()
+if [[ -f "$LISTA" ]]; then while IFS= read -r l; do [[ -n "$l" ]] && PROJETOS+=("$(basename "$l")"); done < "$LISTA"; fi
+pasta_local() { local c; c=$(grep -m1 "/$1\$" "$LISTA" 2>/dev/null) && echo "$c" || echo "$HOME/$1"; }
+SAIDA_APK="$HOME/apks-remotos"
+# adb do Windows: é ele que enxerga o celular no USB do PC; o adb do WSL usa o servidor dele
+# (o "*" é expandido no PC e acha o usuário do Windows; troque se houver mais de um com SDK)
+ADB_WIN="/mnt/c/Users/*/AppData/Local/Android/Sdk/platform-tools/adb.exe"
+
+IGNORAR=(
+  node_modules .git .expo dist web-build ios
+  android/build android/app/build android/.gradle android/.cxx android/app/.cxx
+  android/.kotlin "*.apk" "*.aab" .DS_Store
+)
+
+# Roda yarn install no PC só quando package.json/yarn.lock mudaram (ex.: troca de branch)
+DEPS='h=$(cat package.json yarn.lock | sha1sum); [ "$(cat node_modules/.deps-hash 2>/dev/null)" = "$h" ] || { echo "→ Dependências mudaram, rodando yarn install..."; yarn install --frozen-lockfile && echo "$h" > node_modules/.deps-hash; }'
+
+usa_expo() { grep -q '"expo":' "$(pasta_local "$1")/package.json"; }
+
+sync_name() { echo "$1" | tr '[:upper:]_' '[:lower:]-'; }
+
+# Roda o comando no PC dentro de uma sessão tmux ("<projeto>-<ação>"), criada pelo
+# br-iniciar do PC, que grava a saída em ~/.build-remoto/<sessão>.log. Assim o mesmo
+# terminal pode ser acompanhado no Windows (atalho "Ver terminal do Mac") e no app.
+# Com BR_DETACH=1 só inicia a sessão e retorna (usado pelo app Build Remoto).
+# Uso: em_tmux "<comando>" [args extras do ssh]. Retorna o código de saída do comando.
+em_tmux() {
+  local cmd="$1"; shift
+  local s="${SESSAO:-build-remoto}" st=0
+  printf '%s\n' "$cmd" | ssh "$PC_HOST" "bash -lc 'br-iniciar $s'" || st=$?
+  if [[ $st -eq 3 ]]; then echo "→ $s já está rodando; conectando nela."
+  elif [[ $st -ne 0 ]]; then return $st; fi
+  [[ -n "${BR_DETACH:-}" ]] && return 0
+  ssh -t "$@" "$PC_HOST" "tmux attach -t =$s" || true
+  return "$(ssh -n "$PC_HOST" "cat ~/.build-remoto/$s.status 2>/dev/null || { tmux has-session -t =$s 2>/dev/null && echo 0; } || echo 1")"
+}
+
+remoto() { em_tmux "$1"; }
+
+# Roda no PC usando o celular ligado no USB do PC (via adb server do Windows)
+remoto_com_celular_do_pc() {
+  em_tmux "$ADB_WIN start-server >/dev/null 2>&1; $1"
+}
+
+# Há celular/emulador ligado no próprio Mac? (aí logs e tela rodam direto aqui)
+celular_no_mac() { adb devices 2>/dev/null | grep -q "device$"; }
+
+# Espelha no Mac a tela do celular ligado no PC (scrcpy usando o adb server do Windows
+# por túnel: 5038 -> adb do Windows, 27183 -> vídeo do scrcpy)
+cmd_tela() {
+  if celular_no_mac; then scrcpy --stay-awake "$@"; return; fi
+  cmd_tela_pc "$@"
+}
+
+cmd_tela_pc() {
+  ssh -n "$PC_HOST" "$ADB_WIN start-server >/dev/null 2>&1"
+  ssh -nN -o ExitOnForwardFailure=yes -L 5038:localhost:5037 -L 27183:localhost:27183 "$PC_HOST" &
+  local tunel=$!
+  trap "kill $tunel 2>/dev/null" EXIT
+  sleep 2
+  ADB_SERVER_SOCKET=tcp:localhost:5038 scrcpy --force-adb-forward --stay-awake "$@"
+}
+
+# Roda no PC usando os aparelhos ligados no Mac: o adb do PC fala com o adb server
+# do Mac (túnel 5037) e o celular alcança o Metro do PC (adb reverse + túnel 8081).
+remoto_com_celular_do_mac() {
+  # No app, o túnel fica num processo separado ("build-remoto tunel-mac")
+  [[ -n "${BR_DETACH:-}" ]] && { em_tmux "$1"; return; }
+  adb start-server >/dev/null
+  # O adb server local do PC precisa estar parado para o túnel ocupar a porta 5037
+  ssh -n "$PC_HOST" "bash -lc 'adb kill-server 2>/dev/null; pkill -f \"adb .*fork-server\" 2>/dev/null; true'"
+  em_tmux "$1" -o ExitOnForwardFailure=yes -R 5037:localhost:5037 -L 8081:localhost:8081
+}
+
+# Túnel usado pelo app no modo "celular ligado no Mac": fica aberto até ser encerrado
+cmd_tunel_mac() {
+  adb start-server >/dev/null
+  ssh -n "$PC_HOST" "bash -lc 'adb kill-server 2>/dev/null; pkill -f \"adb .*fork-server\" 2>/dev/null; true'"
+  exec ssh -nN -o ControlMaster=no -o ControlPath=none -o ExitOnForwardFailure=yes \
+    -o ServerAliveInterval=15 -R 5037:localhost:5037 -L 8081:localhost:8081 "$PC_HOST"
+}
+
+cmd_setup() {
+  ssh -n "$PC_HOST" "mkdir -p $REMOTE_DIR"
+  local ignores=()
+  for i in "${IGNORAR[@]}"; do ignores+=(--ignore="$i"); done
+  for p in "${PROJETOS[@]}"; do
+    local n; n=$(sync_name "$p")
+    if mutagen sync list "$n" >/dev/null 2>&1; then
+      echo "• $p: sincronização já existe"
+      continue
+    fi
+    echo "• $p: criando sincronização..."
+    mutagen sync create --name="$n" --mode=one-way-replica \
+      --ignore-vcs "${ignores[@]}" \
+      "$(pasta_local "$p")" "$PC_HOST:${REMOTE_DIR}/$p"
+  done
+  echo
+  echo "Aguardando a primeira cópia terminar..."
+  for p in "${PROJETOS[@]}"; do mutagen sync flush "$(sync_name "$p")"; done
+  echo "Pronto. Agora rode: build-remoto <projeto> install"
+}
+
+checa_projeto() {
+  local p="$1"
+  for x in "${PROJETOS[@]}"; do [[ "$x" == "$p" ]] && return 0; done
+  echo "Projeto desconhecido: $p (opções: ${PROJETOS[*]})" >&2
+  exit 1
+}
+
+cmd_build() {
+  local p="$1" tipo="$2" instalar="${3:-}"
+  local task="assembleDebug" sub="debug"
+  [[ "$tipo" == "release" ]] && task="assembleRelease" sub="release"
+
+  echo "→ Sincronizando $p..."
+  mutagen sync flush "$(sync_name "$p")"
+
+  echo "→ Build $tipo no PC..."
+  remoto "cd $REMOTE_DIR/$p && $DEPS && cd android && ./gradlew $task" || { echo "✗ Build falhou"; return 1; }
+  [[ -n "${BR_DETACH:-}" ]] && return 0   # o app busca o APK depois com "pegar-apk"
+  cmd_pegar_apk "$p" "$tipo" "$instalar"
+}
+
+cmd_pegar_apk() {
+  local p="$1" tipo="$2" instalar="${3:-}" sub="debug"
+  [[ "$tipo" == "release" ]] && sub="release"
+  mkdir -p "$SAIDA_APK/$p"
+  echo "→ Copiando APK para $SAIDA_APK/$p..."
+  scp "$PC_HOST:${REMOTE_DIR}/$p/android/app/build/outputs/apk/$sub/*.apk" "$SAIDA_APK/$p/"
+  local apk; apk=$(ls -t "$SAIDA_APK/$p"/*.apk | head -1)
+  echo "✓ $apk"
+
+  if [[ "$instalar" == "--instalar" ]]; then
+    adb install -r "$apk"
+  fi
+}
+
+[[ $# -lt 1 ]] && { sed -n '4,15p' "$0"; exit 1; }
+
+case "$1" in
+  setup)  cmd_setup ;;
+  status) mutagen sync list ;;
+  tela)   shift; cmd_tela "$@" ;;
+  tela-pc) shift; cmd_tela_pc "$@" ;;
+  tunel-mac) cmd_tunel_mac ;;
+  *)
+    p="$1"; acao="${2:-debug}"
+    SESSAO="$p-$acao"
+    checa_projeto "$p"
+    case "$acao" in
+      debug|release) cmd_build "$p" "$acao" "${3:-}" ;;
+      pegar-apk) cmd_pegar_apk "$p" "${3:-debug}" "${4:-}" ;;
+      android|start)
+               mutagen sync flush "$(sync_name "$p")"
+               remoto_com_celular_do_mac "cd $REMOTE_DIR/$p && $DEPS && yarn $acao" ;;
+      run)     mutagen sync flush "$(sync_name "$p")"
+               remoto_com_celular_do_pc "cd $REMOTE_DIR/$p && $DEPS && yarn android" ;;
+      metro)   remoto_com_celular_do_pc "cd $REMOTE_DIR/$p && $DEPS && yarn start" ;;
+      metro-limpo) if usa_expo "$p"; then c="yarn start --clear"; else c="yarn start --reset-cache"; fi
+               remoto_com_celular_do_pc "cd $REMOTE_DIR/$p && $DEPS && $c" ;;
+      clean)   remoto "cd $REMOTE_DIR/$p/android && ./gradlew clean" ;;
+      logs)    filtro="ReactNativeJS:V ReactNative:V AndroidRuntime:E *:S"
+               if celular_no_mac; then adb logcat -v color ReactNativeJS:V ReactNative:V AndroidRuntime:E "*:S"
+               else remoto_com_celular_do_pc "adb logcat -v color $filtro"; fi ;;
+      logs-tudo) if celular_no_mac; then adb logcat -v color
+                 else remoto_com_celular_do_pc "adb logcat -v color"; fi ;;
+      install) mutagen sync flush "$(sync_name "$p")"; remoto "cd $REMOTE_DIR/$p && rm -f node_modules/.deps-hash && $DEPS" ;;
+      shell)   remoto "cd $REMOTE_DIR/$p && exec bash" ;;
+      *) echo "Ação desconhecida: $acao"; exit 1 ;;
+    esac
+    ;;
+esac

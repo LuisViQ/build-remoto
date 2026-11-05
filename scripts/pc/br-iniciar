@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Usado pelo build-remoto (Mac): cria a sessão tmux "$1" rodando o comando lido do stdin,
+# gravando tudo em ~/.build-remoto/$1.log (com TTY, via script). Estados:
+#   sessão sem .status = rodando | .status = terminou (código) | sem sessão = parada
+# Sai com 3 se a sessão ainda está rodando (não reinicia).
+S="$1"; D="$HOME/.build-remoto"; mkdir -p "$D"
+if tmux has-session -t "=$S" 2>/dev/null; then
+  if [ ! -f "$D/$S.status" ]; then cat >/dev/null; exit 3; fi
+fi
+# encerra restos de uma execução anterior desta sessão (processos órfãos)
+br-encerrar "$S"
+cat > "$D/$S.sh"
+rm -f "$D/$S.status"
+cat > "$D/$S.run" <<RUN
+script -qfec "bash -l $D/$S.sh" "$D/$S.log"
+st=\$?
+echo \$st > "$D/$S.status"
+echo
+echo "— terminou (código \$st). Enter para fechar."
+read
+RUN
+: > "$D/$S.log"
+tmux new-session -d -s "$S" -x 220 -y 50 "bash -l $D/$S.run"
